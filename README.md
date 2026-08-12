@@ -38,5 +38,65 @@ python src/chess_rating_net.py
 ```
 python src/game_analysis.py will output analyzed games with the rating predictions.
 
+## Prototype extension (Thesis 2)
+
+This fork extends the baseline with a frozen-weight inference prototype:
+
+- **Parametrized trainer** (`src/chess_rating_net.py`) — argparse + YAML config
+  (`--data_dir --experiment --train --epochs --lr --batch_size --model_dir
+  --resume`, `train=False` by default), periodic checkpointing, and resume support.
+- **Attention module** (`src/attention.py`) — `BahdanauAttention` and `SelfAttention`.
+- **Anomaly-detection module** (`src/anomaly.py`) — attention-weighted per-move deviation.
+- **FastAPI service** (`src/api.py`) — loads the frozen `model_55.pth` and exposes
+  PGN text/upload endpoints returning per-move ratings, attention weights, and
+  Elo-scale deviations.
+
+### Frozen weights
+
+The released baseline checkpoint (`model_55.pth`, Option C "both" weight
+strategy) is required for inference. It is **not committed** to git (see
+`.gitignore`).
+
+- Expected location: `models/model_55.pth`
+- Download: [Google Drive folder](https://drive.google.com/drive/folders/164qXisHsNAKSM6R7ZMeTeJjPpnZ7s5Rt)
+
+### Quick start (inference API)
+
+PyTorch needs Python 3.12 or 3.13. From the repository root:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# Copy the frozen weights into place
+cp /path/to/model_55.pth models/model_55.pth
+
+# Start the FastAPI service
+python src/api.py
+```
+
+The service binds to `http://0.0.0.0:8000` by default. Set `PORT` to override.
+
+```bash
+curl http://localhost:8000/health
+
+curl -X POST http://localhost:8000/predict/pgn \
+  -H "Content-Type: application/json" \
+  -d '{"pgn": "[Event \"Demo\"]\n[WhiteElo \"1500\"]\n[BlackElo \"1500\"]\n[TimeControl \"300+0\"]\n\n1. e4 {[%clk 0:05:00]} e5 {[%clk 0:05:00]} *"}'
+
+curl -X POST http://localhost:8000/predict/upload -F "file=@game.pgn"
+```
+
+### Training path (optional)
+
+```bash
+python src/chess_rating_net.py --train --data_dir data/processed_games \
+  --experiment cnn_bilstm_clocks_all --epochs 60 --lr 1e-4 --batch_size 32 \
+  --model_dir models --resume models/cnn_bilstm_clocks_all/latest.pth
+```
+
+A YAML config is available at `example_config.yaml`.
+
 ## License
 This project is licensed under the MIT license - see LICENSE.

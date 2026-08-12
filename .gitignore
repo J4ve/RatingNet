@@ -1,0 +1,14 @@
+# Frozen weights and large binaries
+models/
+*.pt
+*.pth
+data/*.pgn
+data/*.csv
+data/*.jsonl
+data/*.pkl
+
+# Runtime artifacts
+logs/
+runs/
+__pycache__/
+*.pyc
