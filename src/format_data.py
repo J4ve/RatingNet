@@ -133,6 +133,71 @@ def game_to_pgn_string(game):
     return pgn_string
 
 
+def time_to_seconds(time_str):
+    """Convert a 'HH:MM:SS' clock string to seconds."""
+    parts = time_str.split(":")
+    return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+
+
+def categorize_time_control(estimated_duration):
+    """Map an estimated game duration in seconds to a Lichess time-control bucket."""
+    if estimated_duration < 29:
+        return "ultrabullet"
+    elif estimated_duration < 179:
+        return "bullet"
+    elif estimated_duration < 479:
+        return "blitz"
+    elif estimated_duration < 1499:
+        return "rapid"
+    else:
+        return "classical"
+
+
+def parse_game_for_inference(game, max_plies=100):
+    """Parse a single PGN game into positions, clocks, and headers for inference.
+
+    Clock-only variant of ``parse_game``: it does not require ``%eval``
+    annotations, which the released model does not need at inference time.
+    """
+    time_control = game.headers.get("TimeControl", "")
+    board = game.board()
+    moves = []
+    clocks = []
+    positions = []
+    node = game
+    ply_count = 0
+    while node.variations and ply_count < max_plies:
+        next_node = node.variation(0)
+        move = next_node.move
+        board.push(move)
+        positions.append(board_to_array(board))
+        moves.append(move.uci())
+
+        comment = next_node.comment
+        clock_match = re.search(r"\[%clk\s+([^\]]+)\]", comment)
+        if clock_match:
+            clocks.append(clock_match.group(1))
+
+        node = next_node
+        ply_count += 1
+
+    if not clocks:
+        return None
+
+    white_elo = game.headers.get("WhiteElo")
+    black_elo = game.headers.get("BlackElo")
+    result = game.headers.get("Result")
+    return {
+        "WhiteElo": white_elo,
+        "BlackElo": black_elo,
+        "Result": result,
+        "Clocks": clocks,
+        "Positions": positions,
+        "Moves": moves,
+        "Time": time_control,
+    }
+
+
 def main():
     year = sys.argv[1]
     month = sys.argv[2]

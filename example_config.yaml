@@ -1,0 +1,24 @@
+# Example configuration for chess_rating_net.py
+# Usage: python src/chess_rating_net.py --config example_config.yaml
+
+data_dir: data/processed_games
+experiment: cnn_bilstm_clocks_all
+epochs: 100
+lr: 0.0001
+batch_size: 32
+val_batch_size: 8192
+model_dir: models
+num_workers: 4
+weight_decay: 1.0e-5
+patience: 5
+lr_factor: 0.5
+conv_filters: 32
+lstm_layers: 3
+lstm_h: 64
+fc1_h: 32
+dropout_rate: 0.5
+bidirectional: true
+use_attention: false
+use_anomaly: false
+attention_type: bahdanau
+attention_dim: 64

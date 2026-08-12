@@ -1,2 +1,9 @@
 chess==1.10.0
 scikit-learn==1.3.2
+torch
+numpy
+pyyaml
+fastapi
+uvicorn
+python-multipart
+tensorboard
