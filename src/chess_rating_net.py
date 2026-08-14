@@ -16,8 +16,13 @@ be loaded for inference without GPU time.
 from __future__ import annotations
 
 import argparse
+import csv
+import hashlib
+import json
+import logging
 import os
 import pickle
+import random
 import sys
 import time
 from pathlib import Path
@@ -28,6 +33,7 @@ _SRC_DIR = Path(__file__).resolve().parent
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -41,6 +47,8 @@ from torch.utils.tensorboard import SummaryWriter
 from attention import BahdanauAttention, SelfAttention
 from anomaly import AnomalyDetector
 from format_data import board_to_array, categorize_time_control, time_to_seconds
+
+logger = logging.getLogger(__name__)
 
 
 class ChessGamesDataset(Dataset):
@@ -96,6 +104,9 @@ class ChessGamesDataset(Dataset):
             "white": white,
             "last_rating": last_rating,
             "result": result,
+            "game_id": Path(self.filenames[idx]).stem,
+            "white_elo": white_elo,
+            "black_elo": black_elo,
         }
 
 
@@ -107,6 +118,9 @@ def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     lengths = torch.tensor([item["length"] for item in batch], dtype=torch.int)
     time_controls = [item["time_control"] for item in batch]
     white = torch.tensor([item["white"] for item in batch])
+    game_ids = [item["game_id"] for item in batch]
+    white_elos = torch.tensor([item["white_elo"] for item in batch], dtype=torch.float)
+    black_elos = torch.tensor([item["black_elo"] for item in batch], dtype=torch.float)
     last_rating = None
     if batch[0]["last_rating"] is not None:
         last_rating = torch.stack([item["last_rating"] for item in batch])
@@ -121,6 +135,9 @@ def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
             "white": white,
             "last_rating": last_rating,
             "results": results,
+            "game_ids": game_ids,
+            "white_elos": white_elos,
+            "black_elos": black_elos,
         }
     return {
         "positions": positions,
@@ -130,6 +147,9 @@ def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "time_controls": time_controls,
         "white": white,
         "last_rating": last_rating,
+        "game_ids": game_ids,
+        "white_elos": white_elos,
+        "black_elos": black_elos,
     }
 
 
@@ -281,8 +301,27 @@ class ChessEloPredictor(nn.Module):
         }
 
     def load_base_state_dict(self, state_dict: dict[str, torch.Tensor], strict: bool = False) -> None:
-        """Load a baseline checkpoint, ignoring keys that belong to attention/anomaly."""
-        self.load_state_dict(state_dict, strict=strict)
+        """Load a baseline checkpoint, ignoring keys that belong to attention/anomaly.
+
+        Warns when the checkpoint lacks attention/anomaly parameters that this
+        model actually uses, since those modules would stay randomly
+        initialized and silently corrupt inference.
+        """
+        result = self.load_state_dict(state_dict, strict=strict)
+        if not strict and result.missing_keys:
+            served_missing = [
+                k
+                for k in result.missing_keys
+                if (self.use_attention and k.startswith("attention."))
+                or (self.use_anomaly and k.startswith("anomaly_detector."))
+            ]
+            if served_missing:
+                logger.warning(
+                    "Checkpoint is missing %d attention/anomaly parameter(s) the served model "
+                    "uses; they remain randomly initialized: %s",
+                    len(served_missing),
+                    served_missing if len(served_missing) <= 8 else served_missing[:8] + ["..."],
+                )
 
 
 def train_one_epoch(
@@ -345,29 +384,64 @@ def test(
     criterion: nn.Module,
     ratings_mean: float = 1514,
     ratings_std: float = 366,
+    per_game_csv: str | None = None,
 ) -> tuple[float, dict[str, float]]:
+    """Evaluate on the test set.
+
+    When ``per_game_csv`` is given, also dumps one row per game
+    (``game_id, white_err, black_err, time_control, white_elo, black_elo``)
+    with errors in Elo points, enabling paired-bootstrap, rating-bracket,
+    calibration, and move-index analyses downstream.
+    """
     model.eval()
     total_test_loss = 0.0
     loss_by_time_control = {tc: 0.0 for tc in ["ultrabullet", "bullet", "blitz", "rapid", "classical"]}
     count_by_time_control = {tc: 0 for tc in ["ultrabullet", "bullet", "blitz", "rapid", "classical"]}
 
-    with torch.no_grad():
-        for batch in test_loader:
-            positions = batch["positions"].to(device)
-            clocks = batch["clocks"].to(device)
-            targets = batch["targets"].to(device)
-            lengths = batch["lengths"]
-            time_controls = batch["time_controls"]
+    csv_file = None
+    csv_writer = None
+    if per_game_csv is not None:
+        csv_file = open(per_game_csv, "w", newline="", encoding="utf-8")
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(["game_id", "white_err", "black_err", "time_control", "white_elo", "black_elo"])
 
-            _, outputs = model(positions, clocks, lengths)
-            loss = criterion(outputs * ratings_std + ratings_mean, targets * ratings_std + ratings_mean)
-            total_test_loss += loss.item()
+    try:
+        with torch.no_grad():
+            for batch in test_loader:
+                positions = batch["positions"].to(device)
+                clocks = batch["clocks"].to(device)
+                targets = batch["targets"].to(device)
+                lengths = batch["lengths"]
+                time_controls = batch["time_controls"]
 
-            if isinstance(criterion, nn.L1Loss):
-                mae = mae_per_item(outputs, targets, ratings_mean, ratings_std)
-                for idx, time_control in enumerate(time_controls):
-                    loss_by_time_control[time_control] += mae[idx].item()
-                    count_by_time_control[time_control] += 1
+                _, outputs = model(positions, clocks, lengths)
+                loss = criterion(outputs * ratings_std + ratings_mean, targets * ratings_std + ratings_mean)
+                total_test_loss += loss.item()
+
+                if isinstance(criterion, nn.L1Loss):
+                    mae = mae_per_item(outputs, targets, ratings_mean, ratings_std)
+                    for idx, time_control in enumerate(time_controls):
+                        loss_by_time_control[time_control] += mae[idx].item()
+                        count_by_time_control[time_control] += 1
+
+                if csv_writer is not None:
+                    abs_errors = torch.abs(
+                        outputs * ratings_std + ratings_mean - targets * ratings_std - ratings_mean
+                    )  # (batch, 2) Elo points
+                    for i, time_control in enumerate(time_controls):
+                        csv_writer.writerow(
+                            [
+                                batch["game_ids"][i],
+                                round(abs_errors[i, 0].item(), 4),
+                                round(abs_errors[i, 1].item(), 4),
+                                time_control,
+                                batch["white_elos"][i].item(),
+                                batch["black_elos"][i].item(),
+                            ]
+                        )
+    finally:
+        if csv_file is not None:
+            csv_file.close()
 
     for key in loss_by_time_control:
         if count_by_time_control[key] > 0:
@@ -383,18 +457,21 @@ def save_checkpoint(
     epoch: int,
     params: dict[str, Any],
     best_val_loss: float | None = None,
+    scheduler: ReduceLROnPlateau | None = None,
+    best_epoch: int | None = None,
 ) -> None:
-    """Save optimizer state, epoch number, and hyperparameters alongside weights."""
-    torch.save(
-        {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "params": params,
-            "best_val_loss": best_val_loss,
-        },
-        path,
-    )
+    """Save optimizer/scheduler state, epoch counters, and hyperparameters alongside weights."""
+    payload: dict[str, Any] = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "params": params,
+        "best_val_loss": best_val_loss,
+        "best_epoch": best_epoch,
+    }
+    if scheduler is not None:
+        payload["scheduler_state_dict"] = scheduler.state_dict()
+    torch.save(payload, path)
 
 
 def load_checkpoint(
@@ -402,13 +479,68 @@ def load_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer | None = None,
     device: torch.device | None = None,
+    scheduler: ReduceLROnPlateau | None = None,
 ) -> dict[str, Any]:
     """Resume from a checkpoint written by ``save_checkpoint``."""
     ckpt = torch.load(path, map_location=device or "cpu")
     model.load_state_dict(ckpt["model_state_dict"])
     if optimizer is not None and "optimizer_state_dict" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    if scheduler is not None and "scheduler_state_dict" in ckpt:
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
     return ckpt
+
+
+def load_or_create_split(
+    data_dir: str,
+    all_files: list[str],
+    split_seed: int,
+) -> tuple[list[str], list[str], list[str], str]:
+    """Deterministic, auditable train/val/test split persisted to ``split_manifest.json``.
+
+    On first run, splits the sorted basenames with ``split_seed`` and writes the
+    manifest (three file lists + SHA-256 over the sorted basenames). On every
+    subsequent run the manifest is loaded and verified instead of recomputed.
+
+    Returns ``(train, val, test)`` basename lists and the manifest hash.
+    """
+    manifest_path = Path(data_dir) / "split_manifest.json"
+    digest = hashlib.sha256("\n".join(all_files).encode("utf-8")).hexdigest()
+
+    if manifest_path.exists():
+        with open(manifest_path, "r") as f:
+            manifest = json.load(f)
+        if manifest.get("sha256") != digest:
+            raise ValueError(
+                f"split_manifest.json hash mismatch (manifest={manifest.get('sha256')}, "
+                f"current={digest}): the data directory changed since the split was frozen. "
+                f"Delete {manifest_path} to recompute the split."
+            )
+        train_names = manifest["train_files"]
+        val_names = manifest["val_files"]
+        test_names = manifest["test_files"]
+        if sorted(train_names + val_names + test_names) != sorted(all_files):
+            raise ValueError(
+                f"split_manifest.json file lists do not match the contents of {data_dir}. "
+                f"Delete {manifest_path} to recompute the split."
+            )
+        print(f"Loaded split manifest {manifest_path} (verified)")
+    else:
+        train_val_names, test_names = train_test_split(all_files, test_size=0.1, random_state=split_seed)
+        train_names, val_names = train_test_split(train_val_names, test_size=0.2, random_state=split_seed)
+        train_names, val_names, test_names = sorted(train_names), sorted(val_names), sorted(test_names)
+        manifest = {
+            "sha256": digest,
+            "split_seed": split_seed,
+            "train_files": train_names,
+            "val_files": val_names,
+            "test_files": test_names,
+        }
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
+        print(f"Wrote split manifest {manifest_path}")
+
+    return train_names, val_names, test_names, digest
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -416,16 +548,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data_dir", default="data/processed_games", help="Directory containing .pkl preprocessed games")
     parser.add_argument("--experiment", default="cnn_bilstm_clocks_all", help="Experiment name (used for model/log dirs)")
     parser.add_argument("--train", action="store_true", default=False, help="Run training (default: inference-only)")
-    parser.add_argument("--epochs", type=int, default=100, help="Maximum number of training epochs")
+    parser.add_argument("--epochs", type=int, default=60, help="Maximum number of training epochs")
     parser.add_argument("--lr", type=float, default=1e-4, help="Adam learning rate")
     parser.add_argument("--batch_size", type=int, default=32, help="Training batch size")
     parser.add_argument("--model_dir", default="models", help="Root directory for checkpoints")
     parser.add_argument("--resume", default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--checkpoint", default=None, help="Checkpoint to evaluate in inference mode (default: discover model_55.pth)")
     parser.add_argument("--config", default=None, help="Optional YAML config file to override defaults")
     parser.add_argument("--use_attention", action="store_true", help="Attach attention module to the model")
     parser.add_argument("--use_anomaly", action="store_true", help="Attach anomaly-detection branch")
-    parser.add_argument("--val_batch_size", type=int, default=8192, help="Validation/test batch size")
+    parser.add_argument("--val_batch_size", type=int, default=512, help="Validation/test batch size")
     parser.add_argument("--num_workers", type=int, default=4, help="DataLoader worker processes")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed for torch/numpy/random and training shuffle (vary across seed-ablation runs)")
+    parser.add_argument("--split_seed", type=int, default=42, help="Train/val/test split seed; NEVER vary (preserves comparability with the paper's 182 MAE)")
     parser.add_argument("--weight_decay", type=float, default=1e-5, help="Adam weight decay")
     parser.add_argument("--patience", type=int, default=5, help="ReduceLROnPlateau patience")
     parser.add_argument("--lr_factor", type=float, default=0.5, help="ReduceLROnPlateau factor")
@@ -456,6 +591,12 @@ def main() -> int:
     parser = build_parser()
     args = load_config(parser.parse_args())
 
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+
     # Hyperparameters: CLI > YAML > checkpoint > defaults.
     params: dict[str, Any] = {
         "train_batch_size": args.batch_size,
@@ -477,6 +618,8 @@ def main() -> int:
         "attention_type": args.attention_type,
         "attention_dim": args.attention_dim,
         "use_anomaly": args.use_anomaly,
+        "seed": args.seed,
+        "split_seed": args.split_seed,
     }
 
     data_dir = args.data_dir
@@ -486,12 +629,18 @@ def main() -> int:
     log_dir = Path("runs") / experiment_name
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    all_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith(".pkl")]
+    all_files = sorted(f for f in os.listdir(data_dir) if f.endswith(".pkl"))
     if not all_files:
         raise FileNotFoundError(f"No .pkl files found in {data_dir}")
 
-    train_val_files, test_files = train_test_split(all_files, test_size=0.1, random_state=42)
-    train_files, val_files = train_test_split(train_val_files, test_size=0.2, random_state=42)
+    train_names, val_names, test_names, manifest_hash = load_or_create_split(data_dir, all_files, args.split_seed)
+    train_files = [os.path.join(data_dir, f) for f in train_names]
+    val_files = [os.path.join(data_dir, f) for f in val_names]
+    test_files = [os.path.join(data_dir, f) for f in test_names]
+
+    print(f"Environment: data_dir={data_dir} files={len(all_files)} seed={args.seed} split_seed={args.split_seed}")
+    print(f"Split: train={len(train_files)} val={len(val_files)} test={len(test_files)} manifest_sha256={manifest_hash}")
+    print(f"Resolved hyperparameters: {params}")
 
     train_dataset = ChessGamesDataset(train_files)
     val_dataset = ChessGamesDataset(val_files)
@@ -503,6 +652,7 @@ def main() -> int:
         shuffle=True,
         collate_fn=collate_fn,
         num_workers=params["num_workers"],
+        generator=g,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -550,27 +700,35 @@ def main() -> int:
 
     if args.resume:
         print(f"Resuming from {args.resume}")
-        ckpt = load_checkpoint(args.resume, model, optimizer, device)
+        ckpt = load_checkpoint(args.resume, model, optimizer, device, scheduler=scheduler)
         start_epoch = ckpt.get("epoch", 0)
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        best_epoch = ckpt.get("best_epoch", 0)
 
     if not args.train:
-        # Inference-only path: load the frozen checkpoint.
-        # Prefer the experiment-specific path, then fall back to the root models/ directory
-        # as recommended in the prototype setup docs (e.g. models/model_55.pth).
-        candidate_paths = [model_dir / "model_55.pth", Path(args.model_dir) / "model_55.pth"]
-        best_path = next((p for p in candidate_paths if p.exists()), None)
-        if best_path is None:
-            raise FileNotFoundError(
-                f"Frozen checkpoint not found. Place model_55.pth at {model_dir / 'model_55.pth'} "
-                f"or {Path(args.model_dir) / 'model_55.pth'}, then retry."
-            )
-        print(f"Loading frozen checkpoint from {best_path}")
+        # Inference-only path: load a checkpoint for evaluation.
+        # Prefer an explicit --checkpoint; otherwise discover the frozen baseline
+        # (experiment-specific path, then the root models/ directory, e.g. models/model_55.pth).
+        if args.checkpoint:
+            best_path = Path(args.checkpoint)
+            if not best_path.exists():
+                raise FileNotFoundError(f"Checkpoint not found: {best_path}")
+        else:
+            candidate_paths = [model_dir / "model_55.pth", Path(args.model_dir) / "model_55.pth"]
+            best_path = next((p for p in candidate_paths if p.exists()), None)
+            if best_path is None:
+                raise FileNotFoundError(
+                    f"Frozen checkpoint not found. Place model_55.pth at {model_dir / 'model_55.pth'} "
+                    f"or {Path(args.model_dir) / 'model_55.pth'}, or pass --checkpoint, then retry."
+                )
+        print(f"Loading checkpoint from {best_path}")
         saved_model = torch.load(best_path, map_location=device)
         model.load_base_state_dict(saved_model["model_state_dict"], strict=False)
-        test_loss, loss_by_tc = test(model, test_loader, device, criterion)
+        per_game_csv = model_dir / "per_game_errors.csv"
+        test_loss, loss_by_tc = test(model, test_loader, device, criterion, per_game_csv=str(per_game_csv))
         print("Test Loss:", test_loss)
         print("Loss by time control:", loss_by_tc)
+        print(f"Wrote per-game errors to {per_game_csv}")
         return 0
 
     writer = SummaryWriter(log_dir=str(log_dir))
@@ -589,18 +747,28 @@ def main() -> int:
         writer.add_scalar("Timing/Epoch Duration", epoch_duration, epoch)
         scheduler.step(val_loss)
 
-        # Periodic every-epoch checkpoint (keeps optimizer state and epoch number).
-        epoch_ckpt = model_dir / f"model_{epoch + 1}.pth"
-        save_checkpoint(epoch_ckpt, model, optimizer, epoch + 1, params, best_val_loss=best_val_loss)
-        save_checkpoint(latest_path, model, optimizer, epoch + 1, params, best_val_loss=best_val_loss)
-        print(f"Saved epoch checkpoint {epoch_ckpt}")
-
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_epoch = epoch
             best_ckpt = model_dir / f"best_model.pth"
-            save_checkpoint(best_ckpt, model, optimizer, epoch + 1, params, best_val_loss=best_val_loss)
+            save_checkpoint(
+                best_ckpt, model, optimizer, epoch + 1, params,
+                best_val_loss=best_val_loss, scheduler=scheduler, best_epoch=best_epoch,
+            )
             print("Saved new best model")
+
+        # Periodic every-epoch checkpoint. Written after the best-loss update so
+        # it carries the post-update best (resume never sees a stale value).
+        epoch_ckpt = model_dir / f"model_{epoch + 1}.pth"
+        save_checkpoint(
+            epoch_ckpt, model, optimizer, epoch + 1, params,
+            best_val_loss=best_val_loss, scheduler=scheduler, best_epoch=best_epoch,
+        )
+        save_checkpoint(
+            latest_path, model, optimizer, epoch + 1, params,
+            best_val_loss=best_val_loss, scheduler=scheduler, best_epoch=best_epoch,
+        )
+        print(f"Saved epoch checkpoint {epoch_ckpt}")
 
     end = time.time()
     print("Training duration (min):", (end - start) / 60)

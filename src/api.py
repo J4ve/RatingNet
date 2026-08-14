@@ -92,9 +92,12 @@ def _load_model() -> tuple[ChessEloPredictor, dict[str, Any], torch.device]:
     saved = torch.load(checkpoint_path, map_location=device, weights_only=False)
     params = saved["params"]
 
-    # Frozen-weight inference uses the baseline architecture. Attention and anomaly
-    # modules are instantiated but not loaded from the checkpoint; their weights are
-    # randomly initialized and would require HPC retraining to be meaningful.
+    # Serve the architecture recorded in the checkpoint. The baseline
+    # model_55.pth carries no attention/anomaly parameters, so both default to
+    # False and the served model matches the loaded weights exactly. Enable
+    # them (via the checkpoint's stored params) only once a trained
+    # attention/anomaly checkpoint is being served; otherwise randomly
+    # initialized modules would silently corrupt every prediction.
     model = ChessEloPredictor(
         conv_filters=params.get("conv_filters", 32),
         lstm_layers=params.get("lstm_layers", 3),
@@ -102,10 +105,10 @@ def _load_model() -> tuple[ChessEloPredictor, dict[str, Any], torch.device]:
         lstm_h=params.get("lstm_h", 64),
         fc1_h=params.get("fc1_h", 32),
         bidirectional=params.get("bidirectional", True),
-        use_attention=True,
+        use_attention=params.get("use_attention", False),
         attention_type=params.get("attention_type", "bahdanau"),
         attention_dim=params.get("attention_dim", 64),
-        use_anomaly=True,
+        use_anomaly=params.get("use_anomaly", False),
     ).to(device)
 
     model.load_base_state_dict(saved["model_state_dict"], strict=False)
@@ -199,19 +202,30 @@ def _run_inference(
         black_baseline = per_move_preds_orig[-1, 1].item()
     baseline = torch.tensor([[white_baseline, black_baseline]], dtype=torch.float)
 
-    # Compute anomaly scores using the attention-weighted deviation formula.
-    # Predictions must be de-standardized so deviations are on the same Elo
-    # scale as the baseline ratings.
-    anomaly = MODEL.anomaly_detector(
-        predictions=per_move_preds_orig.unsqueeze(0),
-        baseline=baseline,
-        attention_weights=outputs["attention_weights"].squeeze(0).unsqueeze(0) if outputs["attention_weights"] is not None else None,
-    )
-    # Squeeze the batch dimension for per-move display.
-    white_deviation = anomaly["white_deviation"].squeeze(0)
-    black_deviation = anomaly["black_deviation"].squeeze(0)
-
+    # Anomaly scoring is only available when the served checkpoint has an anomaly
+    # branch. The baseline model_55.pth does not, so emit neutral scores there.
     seq_len = per_move_preds.size(0)
+    if MODEL.anomaly_detector is not None:
+        # Compute anomaly scores using the attention-weighted deviation formula.
+        # Predictions must be de-standardized so deviations are on the same Elo
+        # scale as the baseline ratings.
+        anomaly = MODEL.anomaly_detector(
+            predictions=per_move_preds_orig.unsqueeze(0),
+            baseline=baseline,
+            attention_weights=outputs["attention_weights"].squeeze(0).unsqueeze(0) if outputs["attention_weights"] is not None else None,
+        )
+        white_deviation = anomaly["white_deviation"].squeeze(0)
+        black_deviation = anomaly["black_deviation"].squeeze(0)
+        white_score = anomaly["white_score"].item()
+        black_score = anomaly["black_score"].item()
+        combined_score = anomaly["combined_score"].item()
+    else:
+        white_deviation = torch.zeros(seq_len)
+        black_deviation = torch.zeros(seq_len)
+        white_score = 0.0
+        black_score = 0.0
+        combined_score = 0.0
+
     move_records = []
     for i in range(seq_len):
         move_records.append(
@@ -232,9 +246,9 @@ def _run_inference(
         "black_baseline": round(black_baseline, 2),
         "white_final_rating": round(per_move_preds_orig[-1, 0].item(), 2),
         "black_final_rating": round(per_move_preds_orig[-1, 1].item(), 2),
-        "white_suspicion_score": round(anomaly["white_score"].item(), 4),
-        "black_suspicion_score": round(anomaly["black_score"].item(), 4),
-        "combined_suspicion_score": round(anomaly["combined_score"].item(), 4),
+        "white_suspicion_score": round(white_score, 4),
+        "black_suspicion_score": round(black_score, 4),
+        "combined_suspicion_score": round(combined_score, 4),
         "per_move": move_records,
     }
 

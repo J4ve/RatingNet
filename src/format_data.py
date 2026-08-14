@@ -9,6 +9,10 @@ import sys
 
 # This file formats the data for deep learning CNN
 
+# Count of games rejected during parsing (missing annotations or misaligned
+# clocks/positions). Inspect after a preprocessing run to gauge rejection rate.
+rejected_games = 0
+
 
 def board_to_array(board):
     """Converts a chess board into a 12-layer 8x8 tensor representing the piece positions."""
@@ -28,6 +32,7 @@ def board_to_array(board):
 
 def parse_game(game):
     """Parses game object to extract evaluations, clocks and positions."""
+    global rejected_games
     time_control = game.headers.get('TimeControl', '')
         
     board = game.board()
@@ -59,6 +64,7 @@ def parse_game(game):
         node = next_node
 
     if not evaluations or not clocks:
+        rejected_games += 1
         return None  # Skip games without evaluations or clock times (correspondence chess)
 
     # Some games did have evals after 150
@@ -80,20 +86,25 @@ def parse_game(game):
 
 
     if len(evaluations) != len(clocks):
+        rejected_games += 1
         print(len(evaluations), len(clocks), len(positions))
         print(game_to_pgn_string(game))
         return -1
     if len(evaluations) != len(positions):
+        rejected_games += 1
         print(len(evaluations), len(clocks), len(positions))
         print(game_to_pgn_string(game))
         return -1
     if len(clocks) != len(positions):
+        rejected_games += 1
         print(len(evaluations), len(clocks), len(positions))
         print(game_to_pgn_string(game))
         return -1
     return {
         "WhiteElo": game.headers.get("WhiteElo", None),
         "BlackElo": game.headers.get("BlackElo", None),
+        "White": game.headers.get("White"),
+        "Black": game.headers.get("Black"),
         "Result": game.headers.get("Result", None),
         "Evaluations": evaluations,
         "Clocks": clocks,
@@ -158,7 +169,10 @@ def parse_game_for_inference(game, max_plies=100):
 
     Clock-only variant of ``parse_game``: it does not require ``%eval``
     annotations, which the released model does not need at inference time.
+    Games with only partial clock annotation are rejected so clocks never
+    silently misalign against positions.
     """
+    global rejected_games
     time_control = game.headers.get("TimeControl", "")
     board = game.board()
     moves = []
@@ -182,6 +196,11 @@ def parse_game_for_inference(game, max_plies=100):
         ply_count += 1
 
     if not clocks:
+        rejected_games += 1
+        return None
+
+    if len(clocks) != len(positions):
+        rejected_games += 1
         return None
 
     white_elo = game.headers.get("WhiteElo")
@@ -190,6 +209,8 @@ def parse_game_for_inference(game, max_plies=100):
     return {
         "WhiteElo": white_elo,
         "BlackElo": black_elo,
+        "White": game.headers.get("White"),
+        "Black": game.headers.get("Black"),
         "Result": result,
         "Clocks": clocks,
         "Positions": positions,
