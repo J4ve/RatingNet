@@ -40,16 +40,36 @@ python src/game_analysis.py will output analyzed games with the rating predictio
 
 ## Prototype extension (Thesis 2)
 
-This fork extends the baseline with a frozen-weight inference prototype:
+This fork is the code base for a BS Computer Science thesis (Camarines Sur
+Polytechnic Colleges) that extends the baseline with attention and anomaly
+detection. Latest build as of 2026-08-14:
 
 - **Parametrized trainer** (`src/chess_rating_net.py`) — argparse + YAML config
   (`--data_dir --experiment --train --epochs --lr --batch_size --model_dir
   --resume`, `train=False` by default), periodic checkpointing, and resume support.
-- **Attention module** (`src/attention.py`) — `BahdanauAttention` and `SelfAttention`.
-- **Anomaly-detection module** (`src/anomaly.py`) — attention-weighted per-move deviation.
-- **FastAPI service** (`src/api.py`) — loads the frozen `model_55.pth` and exposes
-  PGN text/upload endpoints returning per-move ratings, attention weights, and
-  Elo-scale deviations.
+- **Attention module** (`src/attention.py`) — full query-key additive
+  (Bahdanau) attention with a causal-cumulative forward path (ply *t* attends
+  only to plies 1..*t*), wired into the rating head; per-move output preserved,
+  no lookahead.
+- **Anomaly-detection module** (`src/anomaly.py`) — attention-weighted per-move
+  deviation, with a defined `R_baseline` and an Elo-scale unit guard.
+- **Dense supervision** (`--dense_supervision`) — optional all-ply supervision.
+- **FastAPI service** (`src/api.py`) — serves per-move ratings, attention
+  weights, and Elo-scale deviations.
+
+### Status
+
+Done:
+- Baseline reproduced from scratch (train MAE ~181 ≈ the paper's 182).
+
+In progress / pending:
+- [ ] Attention vs baseline ablation on the 170k-game subset (training on the
+      school HPC; results pending).
+- [ ] Full 1.2M-game corpus run.
+- [ ] Anomaly-validation corpus (bot-vs-bot + real-world closed accounts).
+
+The manuscript and experimental plan live in the companion repo
+[J4ve/cs_thesis](https://github.com/J4ve/cs_thesis).
 
 ### Frozen weights
 
